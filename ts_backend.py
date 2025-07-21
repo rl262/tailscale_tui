@@ -997,3 +997,312 @@ _bandwidth_monitor = BandwidthMonitor()
 def get_bandwidth_data() -> Dict:
     """Get current bandwidth data"""
     return _bandwidth_monitor.get_bandwidth_data()
+
+# Advanced Ping Tools
+class PingMonitor:
+    def __init__(self):
+        self.ping_history = {}  # hostname -> list of ping results
+        self.continuous_pings = {}  # hostname -> ping task info
+        self.max_history_points = 100
+        self.ping_intervals = {}  # hostname -> interval in seconds
+        
+    def ping_host_with_stats(self, hostname: str, count: int = 1, timeout: int = 5) -> Dict:
+        """Enhanced ping with detailed statistics"""
+        try:
+            # Use tailscale ping with specific count
+            cmd = ["tailscale", "ping", "-c", str(count), hostname]
+            result = subprocess.run(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, 
+                text=True, timeout=timeout
+            )
+            
+            output = result.stdout + result.stderr
+            
+            # Parse ping results
+            ping_data = {
+                "hostname": hostname,
+                "timestamp": time.time(),
+                "success": False,
+                "latencies": [],
+                "packet_loss": 0,
+                "avg_latency": None,
+                "min_latency": None,
+                "max_latency": None,
+                "raw_output": output
+            }
+            
+            if result.returncode == 0:
+                ping_data["success"] = True
+                
+                # Extract latency values
+                latency_matches = re.findall(r'time[=\s]+(\d+\.?\d*)\s*ms', output, re.IGNORECASE)
+                if latency_matches:
+                    latencies = [float(l) for l in latency_matches]
+                    ping_data["latencies"] = latencies
+                    ping_data["avg_latency"] = sum(latencies) / len(latencies)
+                    ping_data["min_latency"] = min(latencies)
+                    ping_data["max_latency"] = max(latencies)
+                
+                # Extract packet loss
+                loss_match = re.search(r'(\d+)%\s+packet\s+loss', output, re.IGNORECASE)
+                if loss_match:
+                    ping_data["packet_loss"] = int(loss_match.group(1))
+            
+            # Store in history
+            if hostname not in self.ping_history:
+                self.ping_history[hostname] = []
+            
+            self.ping_history[hostname].append(ping_data)
+            
+            # Keep only recent history
+            if len(self.ping_history[hostname]) > self.max_history_points:
+                self.ping_history[hostname] = self.ping_history[hostname][-self.max_history_points:]
+            
+            return ping_data
+            
+        except subprocess.TimeoutExpired:
+            ping_data = {
+                "hostname": hostname,
+                "timestamp": time.time(),
+                "success": False,
+                "latencies": [],
+                "packet_loss": 100,
+                "avg_latency": None,
+                "min_latency": None,
+                "max_latency": None,
+                "raw_output": "Ping timed out"
+            }
+            
+            if hostname not in self.ping_history:
+                self.ping_history[hostname] = []
+            self.ping_history[hostname].append(ping_data)
+            
+            return ping_data
+            
+        except Exception as e:
+            return {
+                "hostname": hostname,
+                "timestamp": time.time(),
+                "success": False,
+                "latencies": [],
+                "packet_loss": 100,
+                "avg_latency": None,
+                "min_latency": None,
+                "max_latency": None,
+                "raw_output": f"Error: {e}"
+            }
+    
+    def get_ping_history(self, hostname: str, limit: int = None) -> List[Dict]:
+        """Get ping history for a specific host"""
+        history = self.ping_history.get(hostname, [])
+        if limit:
+            return history[-limit:]
+        return history
+    
+    def get_ping_statistics(self, hostname: str) -> Dict:
+        """Calculate comprehensive ping statistics"""
+        history = self.ping_history.get(hostname, [])
+        
+        if not history:
+            return {"error": "No ping data available"}
+        
+        # Gather all successful pings
+        successful_pings = [p for p in history if p["success"] and p["avg_latency"] is not None]
+        all_latencies = []
+        
+        for ping in successful_pings:
+            if ping["latencies"]:
+                all_latencies.extend(ping["latencies"])
+        
+        total_pings = len(history)
+        successful_count = len(successful_pings)
+        failed_count = total_pings - successful_count
+        
+        stats = {
+            "hostname": hostname,
+            "total_pings": total_pings,
+            "successful_pings": successful_count,
+            "failed_pings": failed_count,
+            "success_rate": (successful_count / total_pings * 100) if total_pings > 0 else 0,
+            "packet_loss_rate": (failed_count / total_pings * 100) if total_pings > 0 else 0
+        }
+        
+        if all_latencies:
+            stats.update({
+                "avg_latency": sum(all_latencies) / len(all_latencies),
+                "min_latency": min(all_latencies),
+                "max_latency": max(all_latencies),
+                "latency_stddev": calculate_stddev(all_latencies),
+                "recent_trend": calculate_trend(all_latencies[-10:]) if len(all_latencies) >= 5 else "insufficient_data"
+            })
+        
+        # Calculate availability over time periods
+        now = time.time()
+        for period_name, seconds in [("1_hour", 3600), ("24_hours", 86400), ("7_days", 604800)]:
+            period_pings = [p for p in history if now - p["timestamp"] <= seconds]
+            if period_pings:
+                period_successful = len([p for p in period_pings if p["success"]])
+                stats[f"availability_{period_name}"] = (period_successful / len(period_pings) * 100)
+        
+        return stats
+    
+    def generate_ping_graph(self, hostname: str, width: int = 60, height: int = 10) -> List[str]:
+        """Generate ASCII graph of ping latencies"""
+        history = self.get_ping_history(hostname, width)
+        
+        if not history:
+            return [f"No ping data for {hostname}"] + [" " * width for _ in range(height - 1)]
+        
+        # Extract latencies for graphing
+        latencies = []
+        for ping in history:
+            if ping["success"] and ping["avg_latency"] is not None:
+                latencies.append(ping["avg_latency"])
+            else:
+                latencies.append(None)  # Failed ping
+        
+        # Create graph
+        graph = [[" " for _ in range(width)] for _ in range(height)]
+        
+        # Add title
+        title = f"Ping: {hostname} (last {len(latencies)} tests)"
+        for i, char in enumerate(title[:width]):
+            graph[0][i] = char
+        
+        if not any(l for l in latencies if l is not None):
+            # All pings failed
+            fail_msg = "All pings failed"
+            start_pos = (width - len(fail_msg)) // 2
+            for i, char in enumerate(fail_msg):
+                if start_pos + i < width:
+                    graph[height // 2][start_pos + i] = char
+            return [''.join(row) for row in graph]
+        
+        # Find min/max for scaling
+        valid_latencies = [l for l in latencies if l is not None]
+        if valid_latencies:
+            min_lat = min(valid_latencies)
+            max_lat = max(valid_latencies)
+            lat_range = max_lat - min_lat if max_lat > min_lat else 1
+            
+            # Plot points
+            for x, latency in enumerate(latencies):
+                if x >= width:
+                    break
+                    
+                if latency is not None:
+                    # Calculate y position
+                    normalized = (latency - min_lat) / lat_range
+                    y_pos = int((height - 3) * (1 - normalized)) + 1
+                    y_pos = max(1, min(height - 1, y_pos))
+                    
+                    # Choose character based on latency level
+                    if latency < 20:
+                        char = "●"  # Excellent
+                    elif latency < 50:
+                        char = "○"  # Good
+                    elif latency < 100:
+                        char = "◐"  # Fair
+                    else:
+                        char = "◯"  # Poor
+                        
+                    graph[y_pos][x] = char
+                else:
+                    # Failed ping
+                    graph[height - 1][x] = "✗"
+            
+            # Add scale
+            scale_text = f"{min_lat:.1f}ms - {max_lat:.1f}ms"
+            for i, char in enumerate(scale_text):
+                if width - len(scale_text) + i < width:
+                    graph[1][width - len(scale_text) + i] = char
+        
+        return [''.join(row) for row in graph]
+
+def calculate_stddev(values: List[float]) -> float:
+    """Calculate standard deviation"""
+    if len(values) < 2:
+        return 0
+    
+    mean = sum(values) / len(values)
+    variance = sum((x - mean) ** 2 for x in values) / len(values)
+    return variance ** 0.5
+
+def calculate_trend(values: List[float]) -> str:
+    """Calculate trend direction from recent values"""
+    if len(values) < 3:
+        return "insufficient_data"
+    
+    # Simple trend calculation
+    first_half = sum(values[:len(values)//2]) / (len(values)//2)
+    second_half = sum(values[len(values)//2:]) / (len(values) - len(values)//2)
+    
+    diff_percent = ((second_half - first_half) / first_half) * 100 if first_half > 0 else 0
+    
+    if diff_percent > 10:
+        return "worsening"
+    elif diff_percent < -10:
+        return "improving"
+    else:
+        return "stable"
+
+def format_ping_duration(seconds: float) -> str:
+    """Format duration in human readable format"""
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    elif seconds < 3600:
+        return f"{seconds/60:.1f}m"
+    elif seconds < 86400:
+        return f"{seconds/3600:.1f}h"
+    else:
+        return f"{seconds/86400:.1f}d"
+
+# Global ping monitor instance
+_ping_monitor = PingMonitor()
+
+def ping_host_advanced(hostname: str, count: int = 1) -> Dict:
+    """Advanced ping with statistics tracking"""
+    return _ping_monitor.ping_host_with_stats(hostname, count)
+
+def get_ping_history(hostname: str, limit: int = None) -> List[Dict]:
+    """Get ping history for a host"""
+    return _ping_monitor.get_ping_history(hostname, limit)
+
+def get_ping_statistics(hostname: str) -> Dict:
+    """Get comprehensive ping statistics"""
+    return _ping_monitor.get_ping_statistics(hostname)
+
+def generate_ping_graph(hostname: str, width: int = 60, height: int = 10) -> List[str]:
+    """Generate ping latency graph"""
+    return _ping_monitor.generate_ping_graph(hostname, width, height)
+
+def get_multi_ping_comparison(hostnames: List[str], count: int = 3) -> Dict:
+    """Ping multiple hosts and compare results"""
+    results = {}
+    
+    for hostname in hostnames:
+        results[hostname] = ping_host_advanced(hostname, count)
+    
+    # Calculate comparison metrics
+    successful_hosts = {h: r for h, r in results.items() if r["success"]}
+    
+    comparison = {
+        "results": results,
+        "summary": {
+            "total_hosts": len(hostnames),
+            "successful_hosts": len(successful_hosts),
+            "failed_hosts": len(hostnames) - len(successful_hosts)
+        }
+    }
+    
+    if successful_hosts:
+        latencies = [r["avg_latency"] for r in successful_hosts.values() if r["avg_latency"]]
+        if latencies:
+            comparison["summary"].update({
+                "fastest_host": min(successful_hosts.keys(), key=lambda h: successful_hosts[h]["avg_latency"]),
+                "slowest_host": max(successful_hosts.keys(), key=lambda h: successful_hosts[h]["avg_latency"]),
+                "avg_latency_all": sum(latencies) / len(latencies),
+                "latency_range": max(latencies) - min(latencies)
+            })
+    
+    return comparison
